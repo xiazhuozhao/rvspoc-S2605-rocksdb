@@ -20,6 +20,9 @@
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+#ifdef __riscv_vector
+#include <riscv_vector.h>
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -228,6 +231,68 @@ class FastLocalBloomImpl {
     return HashMayMatchPrepared(h2, num_probes, data + bytes_to_cache_line);
   }
 
+#if defined(__riscv_vector)
+  // Keep the uncommon high-probe vector path out of the hot inline function.
+  // This avoids expanding RVV setup into every normal (typically six-probe)
+  // lookup call site.
+  __attribute__((noinline)) static bool HashMayMatchPreparedRiscvVector(
+      uint32_t h, int num_probes, const char* data_at_cache_line) {
+    // Powers of the 32-bit golden ratio, modulo 2**32. Loading only the
+    // active lanes makes this work unchanged with VLEN 128, 256, and 512.
+    alignas(64) static constexpr uint32_t kMultipliers[30] = {
+        0x00000001u, 0x9e3779b9u, 0xe35e67b1u, 0x734297e9u,
+        0x35fbe861u, 0xdeb7c719u, 0x0448b211u, 0x3459b749u,
+        0xab25f4c1u, 0x52941879u, 0x9c95e071u, 0xf5ab9aa9u,
+        0x2d6ba521u, 0x8bededd9u, 0x9bfb72d1u, 0x3ae1c209u,
+        0x7fca7981u, 0xc576c739u, 0xd23ee931u, 0x0335ad69u,
+        0xc04ff1e1u, 0x98702499u, 0x7535c391u, 0x9f70dcc9u,
+        0x0e198e41u, 0xf2ab85f9u, 0xe6c581f1u, 0xc7ecd029u,
+        0x6f54cea1u, 0x4c8a6b59u};
+
+    // Preserve scalar early-exit behavior before paying the vector setup
+    // cost. The vector multipliers below are relative to the original hash.
+    uint32_t early_hash = h;
+    for (int probe = 0; probe < 2;
+         ++probe, early_hash *= uint32_t{0x9e3779b9}) {
+      const int bitpos = early_hash >> (32 - 9);
+      if ((data_at_cache_line[bitpos >> 3] &
+           (char(1) << (bitpos & 7))) == 0) {
+        return false;
+      }
+    }
+
+    int probe = 2;
+    while (probe < num_probes) {
+      const size_t vl = __riscv_vsetvl_e32m1(num_probes - probe);
+      const vuint32m1_t multipliers =
+          __riscv_vle32_v_u32m1(kMultipliers + probe, vl);
+      const vuint32m1_t hashes =
+          __riscv_vmul_vx_u32m1(multipliers, h, vl);
+      const vuint32m1_t byte_offsets =
+          __riscv_vsrl_vx_u32m1(hashes, 26, vl);
+      const vuint8mf4_t bytes8 = __riscv_vluxei32_v_u8mf4(
+          reinterpret_cast<const uint8_t*>(data_at_cache_line), byte_offsets,
+          vl);
+      const vuint16mf2_t bytes16 = __riscv_vzext_vf2_u16mf2(bytes8, vl);
+      const vuint32m1_t bytes = __riscv_vzext_vf2_u32m1(bytes16, vl);
+      const vuint32m1_t bit_offsets = __riscv_vand_vx_u32m1(
+          __riscv_vsrl_vx_u32m1(hashes, 23, vl), 7, vl);
+      const vuint32m1_t ones = __riscv_vmv_v_x_u32m1(1, vl);
+      const vuint32m1_t masks =
+          __riscv_vsll_vv_u32m1(ones, bit_offsets, vl);
+      const vuint32m1_t present =
+          __riscv_vand_vv_u32m1(bytes, masks, vl);
+      const vbool32_t missing =
+          __riscv_vmseq_vx_u32m1_b32(present, 0, vl);
+      if (__riscv_vcpop_m_b32(missing, vl) != 0) {
+        return false;
+      }
+      probe += static_cast<int>(vl);
+    }
+    return true;
+  }
+#endif
+
   static inline bool HashMayMatchPrepared(uint32_t h2, int num_probes,
                                           const char* data_at_cache_line) {
     uint32_t h = h2;
@@ -331,6 +396,24 @@ class FastLocalBloomImpl {
       h *= 0xab25f4c1;
       rem_probes -= 8;
     }
+#elif defined(__riscv_vector)
+    // Setting up indexed vector loads costs more than a short scalar probe
+    // sequence on typical out-of-order RV64 cores, especially for negative
+    // lookups that usually fail on the first few bits. Keep that fast path and
+    // reserve RVV for filters with enough probes to amortize setup.
+    if (num_probes > 8) {
+      return HashMayMatchPreparedRiscvVector(h, num_probes,
+                                             data_at_cache_line);
+    }
+    for (int probe = 0; probe < num_probes;
+         ++probe, h *= uint32_t{0x9e3779b9}) {
+      const int bitpos = h >> (32 - 9);
+      if ((data_at_cache_line[bitpos >> 3] &
+           (char(1) << (bitpos & 7))) == 0) {
+        return false;
+      }
+    }
+    return true;
 #else
     for (int i = 0; i < num_probes; ++i, h *= uint32_t{0x9e3779b9}) {
       // 9-bit address within 512 bit cache line

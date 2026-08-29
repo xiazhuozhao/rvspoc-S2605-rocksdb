@@ -13,6 +13,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "port/lang.h"
@@ -50,6 +51,10 @@ ASSERT_FEATURE_COMPAT_HEADER();
 #ifdef __SSE4_2__
 #include <nmmintrin.h>
 #include <wmmintrin.h>
+#endif
+
+#ifdef __riscv_vector
+#include <riscv_vector.h>
 #endif
 
 #if defined(HAVE_ARM64_CRC)
@@ -313,6 +318,102 @@ uint32_t ExtendImpl(uint32_t crc, const char* buf, size_t size) {
   return static_cast<uint32_t>(l ^ 0xffffffffu);
 }
 
+#if defined(__riscv_vector)
+// Compute independent contiguous chunks in RVV lanes, then concatenate their
+// CRCs with RocksDB's existing GF(2) combiner. Indexed byte loads allow each
+// lane to advance through its own chunk, while indexed table loads replace a
+// scalar lookup per byte. The active lane count comes from vsetvl, so the same
+// binary is valid for VLEN 128/256/512.
+uint32_t ExtendRVVImpl(uint32_t crc, const char* buf, size_t size) {
+  constexpr size_t kMinVectorBytes = 512;
+  constexpr size_t kMaxLanes = 16;
+  if (size < kMinVectorBytes ||
+      size > std::numeric_limits<uint32_t>::max()) {
+    return ExtendImpl<DefaultCRC32>(crc, buf, size);
+  }
+
+  const size_t vl = __riscv_vsetvl_e32m1(kMaxLanes);
+  const uint32_t chunk_size = static_cast<uint32_t>(size / vl);
+  if (chunk_size == 0) {
+    return ExtendImpl<DefaultCRC32>(crc, buf, size);
+  }
+
+  const vuint32m1_t lanes = __riscv_vid_v_u32m1(vl);
+  const vuint32m1_t chunk_offsets =
+      __riscv_vmul_vx_u32m1(lanes, chunk_size, vl);
+  vuint32m1_t states = __riscv_vmv_v_x_u32m1(0xffffffffu, vl);
+
+  for (uint32_t pos = 0; pos < chunk_size; ++pos) {
+    const vuint32m1_t offsets =
+        __riscv_vadd_vx_u32m1(chunk_offsets, pos, vl);
+    const vuint8mf4_t bytes8 = __riscv_vluxei32_v_u8mf4(
+        reinterpret_cast<const uint8_t*>(buf), offsets, vl);
+    const vuint16mf2_t bytes16 = __riscv_vzext_vf2_u16mf2(bytes8, vl);
+    const vuint32m1_t bytes32 = __riscv_vzext_vf2_u32m1(bytes16, vl);
+    vuint32m1_t table_offsets =
+        __riscv_vxor_vv_u32m1(states, bytes32, vl);
+    table_offsets = __riscv_vand_vx_u32m1(table_offsets, 255, vl);
+    table_offsets = __riscv_vsll_vx_u32m1(table_offsets, 2, vl);
+    const vuint32m1_t table_values =
+        __riscv_vluxei32_v_u32m1(table0_, table_offsets, vl);
+    states = __riscv_vxor_vv_u32m1(
+        table_values, __riscv_vsrl_vx_u32m1(states, 8, vl), vl);
+  }
+
+  states = __riscv_vxor_vx_u32m1(states, 0xffffffffu, vl);
+  alignas(64) uint32_t partial[kMaxLanes];
+  __riscv_vse32_v_u32m1(partial, states, vl);
+
+  uint32_t combined = crc;
+  for (size_t lane = 0; lane < vl; ++lane) {
+    combined = Crc32cCombine(combined, partial[lane], chunk_size);
+  }
+  const size_t covered = static_cast<size_t>(chunk_size) * vl;
+  return ExtendImpl<DefaultCRC32>(combined, buf + covered, size - covered);
+}
+
+// Four independent chains expose enough instruction-level parallelism for
+// out-of-order RISC-V cores while preserving the exact portable CRC math.
+uint32_t ExtendRiscvParallelImpl(uint32_t crc, const char* buf, size_t size) {
+  constexpr size_t kStreams = 4;
+  if (size < 1024) {
+    return ExtendImpl<DefaultCRC32>(crc, buf, size);
+  }
+  const size_t chunk_size = (size / kStreams) & ~size_t{15};
+  if (chunk_size == 0) {
+    return ExtendImpl<DefaultCRC32>(crc, buf, size);
+  }
+
+  uint64_t states[kStreams] = {0xffffffffu, 0xffffffffu, 0xffffffffu,
+                              0xffffffffu};
+  const uint8_t* streams[kStreams] = {
+      reinterpret_cast<const uint8_t*>(buf),
+      reinterpret_cast<const uint8_t*>(buf + chunk_size),
+      reinterpret_cast<const uint8_t*>(buf + chunk_size * 2),
+      reinterpret_cast<const uint8_t*>(buf + chunk_size * 3)};
+  const uint8_t* const end = streams[0] + chunk_size;
+  while (streams[0] < end) {
+    DefaultCRC32(&states[0], &streams[0]);
+    DefaultCRC32(&states[1], &streams[1]);
+    DefaultCRC32(&states[2], &streams[2]);
+    DefaultCRC32(&states[3], &streams[3]);
+    DefaultCRC32(&states[0], &streams[0]);
+    DefaultCRC32(&states[1], &streams[1]);
+    DefaultCRC32(&states[2], &streams[2]);
+    DefaultCRC32(&states[3], &streams[3]);
+  }
+
+  uint32_t combined = crc;
+  for (size_t stream = 0; stream < kStreams; ++stream) {
+    combined = Crc32cCombine(
+        combined, static_cast<uint32_t>(states[stream] ^ 0xffffffffu),
+        chunk_size);
+  }
+  const size_t covered = chunk_size * kStreams;
+  return ExtendImpl<DefaultCRC32>(combined, buf + covered, size - covered);
+}
+#endif
+
 using Function = uint32_t (*)(uint32_t, const char*, size_t);
 
 #if defined(HAVE_POWER8) && defined(HAS_ALTIVEC)
@@ -382,6 +483,9 @@ std::string IsFastCrc32Supported() {
     has_fast_crc = false;
     arch = "Arm64";
   }
+#elif defined(__riscv_vector)
+  has_fast_crc = true;
+  arch = "RISC-V RVV/parallel";
 #else
 #ifdef __SSE4_2__
   has_fast_crc = true;
@@ -1113,6 +1217,12 @@ static inline Function Choose_Extend() {
   } else {
     return ExtendImpl<DefaultCRC32>;
   }
+#elif defined(__riscv_vector)
+  // At VLEN >= 512, sixteen table-lookup streams amortize indexed-gather
+  // setup. Narrower implementations use the four-chain version, which avoids
+  // regressing cores where gathers have relatively high latency.
+  return __riscv_vsetvlmax_e32m1() >= 16 ? ExtendRVVImpl
+                                         : ExtendRiscvParallelImpl;
 #elif defined(__SSE4_2__) && defined(__PCLMUL__) && !defined NO_THREEWAY_CRC32C
   // NOTE: runtime detection no longer supported on x86
 #ifdef _MSC_VER

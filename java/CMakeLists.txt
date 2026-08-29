@@ -61,6 +61,7 @@ set(JNI_NATIVE_SOURCES
         rocksjni/options_util.cc
         rocksjni/persistent_cache.cc
         rocksjni/ratelimiterjni.cc
+        rocksjni/remove_consumequeue_compactionfilterjni.cc
         rocksjni/remove_emptyvalue_compactionfilterjni.cc
         rocksjni/restorejni.cc
         rocksjni/rocks_callback_object.cc
@@ -225,6 +226,7 @@ set(JAVA_MAIN_CLASSES
   src/main/java/org/rocksdb/RateLimiterMode.java
   src/main/java/org/rocksdb/ReadOptions.java
   src/main/java/org/rocksdb/ReadTier.java
+  src/main/java/org/rocksdb/RemoveConsumeQueueCompactionFilter.java
   src/main/java/org/rocksdb/RemoveEmptyValueCompactionFilter.java
   src/main/java/org/rocksdb/RestoreOptions.java
   src/main/java/org/rocksdb/ReusedSynchronisationType.java
@@ -852,12 +854,25 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
     )
     set(ROCKSDB_JAR rocksdbjni-${CMAKE_PROJECT_VERSION}-win${bitness}.jar)
 elseif(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    set_target_properties(
-            ${ROCKSDBJNI_STATIC_LIB}
-            PROPERTIES
-            OUTPUT_NAME "rocksdbjni-linux${bitness}"
-    )
-    set(ROCKSDB_JAR rocksdbjni-${CMAKE_PROJECT_VERSION}-linux${bitness}.jar)
+    if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "riscv64")
+        # NativeLibraryLoader includes the architecture in its RISC-V lookup.
+        # Match that name for cross builds instead of the generic bitness-only
+        # name, which cannot be loaded from a JAR on RISC-V.
+        set_target_properties(
+                ${ROCKSDBJNI_STATIC_LIB}
+                PROPERTIES
+                OUTPUT_NAME "rocksdbjni-linux-riscv64"
+        )
+        set(ROCKSDB_JAR
+                rocksdbjni-${CMAKE_PROJECT_VERSION}-linux-riscv64.jar)
+    else()
+        set_target_properties(
+                ${ROCKSDBJNI_STATIC_LIB}
+                PROPERTIES
+                OUTPUT_NAME "rocksdbjni-linux${bitness}"
+        )
+        set(ROCKSDB_JAR rocksdbjni-${CMAKE_PROJECT_VERSION}-linux${bitness}.jar)
+    endif()
 elseif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     set_target_properties(
             ${ROCKSDBJNI_STATIC_LIB}

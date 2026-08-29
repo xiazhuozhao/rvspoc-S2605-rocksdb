@@ -26,9 +26,67 @@
 #include <string>
 #include <string_view>
 
+#if defined(__riscv_vector)
+#include <riscv_vector.h>
+#endif
+
 #include "rocksdb/cleanable.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+#if defined(__riscv)
+namespace slice_riscv_detail {
+
+// Find the first different byte without calling the generic libc memcmp.
+// RVV naturally adapts to VLEN through vsetvl; a word-at-a-time fallback
+// keeps short keys cheap and also supports scalar RISC-V builds.
+inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
+  size_t off = 0;
+  // Comparator inputs commonly differ in their first byte. Avoid setting up
+  // either word or vector operations for that latency-sensitive case.
+  if (len != 0) {
+    if (a[0] != b[0]) {
+      return 0;
+    }
+    off = 1;
+  }
+#if defined(__riscv_vector)
+  if (len - off >= 32) {
+    while (off < len) {
+      const size_t vl = __riscv_vsetvl_e8m1(len - off);
+      const vuint8m1_t av = __riscv_vle8_v_u8m1(
+          reinterpret_cast<const uint8_t*>(a + off), vl);
+      const vuint8m1_t bv = __riscv_vle8_v_u8m1(
+          reinterpret_cast<const uint8_t*>(b + off), vl);
+      const vbool8_t different = __riscv_vmsne_vv_u8m1_b8(av, bv, vl);
+      const long first = __riscv_vfirst_m_b8(different, vl);
+      if (first >= 0) {
+        return off + static_cast<size_t>(first);
+      }
+      off += vl;
+    }
+    return off;
+  }
+#endif
+  while (off + sizeof(uint64_t) <= len) {
+    uint64_t av;
+    uint64_t bv;
+    memcpy(&av, a + off, sizeof(av));
+    memcpy(&bv, b + off, sizeof(bv));
+    const uint64_t different = av ^ bv;
+    if (different != 0) {
+      return off + static_cast<size_t>(__builtin_ctzll(different) >> 3);
+    }
+    off += sizeof(uint64_t);
+  }
+  while (off < len && a[off] == b[off]) {
+    ++off;
+  }
+  return off;
+}
+
+}  // namespace slice_riscv_detail
+#endif
 
 class Slice {
  public:
@@ -283,7 +341,16 @@ inline bool operator!=(const Slice& x, const Slice& y) { return !(x == y); }
 inline int Slice::compare(const Slice& b) const {
   assert(data_ != nullptr && b.data_ != nullptr);
   const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
+#if defined(__riscv)
+  const size_t diff = slice_riscv_detail::DifferenceOffset(data_, b.data_,
+                                                           min_len);
+  int r = diff == min_len
+              ? 0
+              : static_cast<int>(static_cast<unsigned char>(data_[diff])) -
+                    static_cast<int>(static_cast<unsigned char>(b.data_[diff]));
+#else
   int r = memcmp(data_, b.data_, min_len);
+#endif
   if (r == 0) {
     if (size_ < b.size_)
       r = -1;
@@ -294,12 +361,16 @@ inline int Slice::compare(const Slice& b) const {
 }
 
 inline size_t Slice::difference_offset(const Slice& b) const {
-  size_t off = 0;
   const size_t len = (size_ < b.size_) ? size_ : b.size_;
+#if defined(__riscv)
+  return slice_riscv_detail::DifferenceOffset(data_, b.data_, len);
+#else
+  size_t off = 0;
   for (; off < len; off++) {
     if (data_[off] != b.data_[off]) break;
   }
   return off;
+#endif
 }
 
 }  // namespace ROCKSDB_NAMESPACE
