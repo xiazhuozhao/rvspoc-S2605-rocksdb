@@ -41,17 +41,14 @@ namespace slice_riscv_detail {
 // RVV naturally adapts to VLEN through vsetvl; a word-at-a-time fallback
 // keeps short keys cheap and also supports scalar RISC-V builds.
 inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
-  size_t off = 0;
   // Comparator inputs commonly differ in their first byte. Avoid setting up
   // either word or vector operations for that latency-sensitive case.
-  if (len != 0) {
-    if (a[0] != b[0]) {
-      return 0;
-    }
-    off = 1;
+  if (len == 0 || a[0] != b[0]) {
+    return 0;
   }
 #if defined(__riscv_vector)
-  if (len - off >= 32) {
+  if (len >= 32) {
+    size_t off = 0;
     while (off < len) {
       const size_t vl = __riscv_vsetvl_e8m1(len - off);
       const vuint8m1_t av = __riscv_vle8_v_u8m1(
@@ -67,6 +64,12 @@ inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
     }
     return off;
   }
+  size_t off = 0;
+#else
+  // On scalar RISC-V the existing offset-one loop gives the compiler a
+  // better short-key schedule. Keep it as the fallback rather than forcing
+  // the RVV-tuned aligned-word layout on non-vector targets.
+  size_t off = 1;
 #endif
   while (off + sizeof(uint64_t) <= len) {
     uint64_t av;
@@ -75,7 +78,11 @@ inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
     memcpy(&bv, b + off, sizeof(bv));
     const uint64_t different = av ^ bv;
     if (different != 0) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
       return off + static_cast<size_t>(__builtin_ctzll(different) >> 3);
+#else
+      return off + static_cast<size_t>(__builtin_clzll(different) >> 3);
+#endif
     }
     off += sizeof(uint64_t);
   }
@@ -332,8 +339,14 @@ struct SliceParts {
 };
 
 inline bool operator==(const Slice& x, const Slice& y) {
+#if defined(__riscv_vector)
+  return x.size() == y.size() &&
+         slice_riscv_detail::DifferenceOffset(x.data(), y.data(), x.size()) ==
+             x.size();
+#else
   return ((x.size() == y.size()) &&
           (memcmp(x.data(), y.data(), x.size()) == 0));
+#endif
 }
 
 inline bool operator!=(const Slice& x, const Slice& y) { return !(x == y); }
