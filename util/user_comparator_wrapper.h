@@ -13,23 +13,35 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+#if defined(__riscv)
+#define ROCKSDB_USER_COMPARATOR_ALWAYS_INLINE __attribute__((always_inline))
+#else
+#define ROCKSDB_USER_COMPARATOR_ALWAYS_INLINE
+#endif
+
 // Wrapper of user comparator, with auto increment to
 // perf_context.user_key_comparison_count.
 class UserComparatorWrapper {
  public:
   // `UserComparatorWrapper`s constructed with the default constructor are not
   // usable and will segfault on any attempt to use them for comparisons.
-  UserComparatorWrapper() : user_comparator_(nullptr) {}
+  UserComparatorWrapper()
+      : user_comparator_(nullptr), is_bytewise_comparator_(false) {}
 
   explicit UserComparatorWrapper(const Comparator* const user_cmp)
-      : user_comparator_(user_cmp) {}
+      : user_comparator_(user_cmp),
+        is_bytewise_comparator_(user_cmp == BytewiseComparator()) {}
 
   ~UserComparatorWrapper() = default;
 
   const Comparator* user_comparator() const { return user_comparator_; }
 
-  int Compare(const Slice& a, const Slice& b) const {
+  ROCKSDB_USER_COMPARATOR_ALWAYS_INLINE int Compare(const Slice& a,
+                                                     const Slice& b) const {
     PERF_COUNTER_ADD(user_key_comparison_count, 1);
+    if (is_bytewise_comparator_) {
+      return a.compare(b);
+    }
     return user_comparator_->Compare(a, b);
   }
 
@@ -42,14 +54,21 @@ class UserComparatorWrapper {
     return user_comparator_->CompareTimestamp(ts1, ts2);
   }
 
-  int CompareWithoutTimestamp(const Slice& a, const Slice& b) const {
+  ROCKSDB_USER_COMPARATOR_ALWAYS_INLINE int CompareWithoutTimestamp(
+      const Slice& a, const Slice& b) const {
     PERF_COUNTER_ADD(user_key_comparison_count, 1);
+    if (is_bytewise_comparator_) {
+      return a.compare(b);
+    }
     return user_comparator_->CompareWithoutTimestamp(a, b);
   }
 
-  int CompareWithoutTimestamp(const Slice& a, bool a_has_ts, const Slice& b,
-                              bool b_has_ts) const {
+  ROCKSDB_USER_COMPARATOR_ALWAYS_INLINE int CompareWithoutTimestamp(
+      const Slice& a, bool a_has_ts, const Slice& b, bool b_has_ts) const {
     PERF_COUNTER_ADD(user_key_comparison_count, 1);
+    if (is_bytewise_comparator_) {
+      return a.compare(b);
+    }
     return user_comparator_->CompareWithoutTimestamp(a, a_has_ts, b, b_has_ts);
   }
 
@@ -59,6 +78,12 @@ class UserComparatorWrapper {
 
  private:
   const Comparator* user_comparator_;
+  // Most RocksDB deployments use the built-in bytewise comparator. Cache its
+  // identity once so hot memtable and block searches avoid a virtual call for
+  // every key comparison while custom comparators retain their exact path.
+  bool is_bytewise_comparator_;
 };
+
+#undef ROCKSDB_USER_COMPARATOR_ALWAYS_INLINE
 
 }  // namespace ROCKSDB_NAMESPACE
