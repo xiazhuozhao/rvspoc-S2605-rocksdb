@@ -40,6 +40,12 @@ class IndexBlockIter;
 class MetaBlockIter;
 class BlockPrefixIndex;
 
+#if defined(__riscv)
+int CompareBlockUserKey(const Comparator* comparator,
+                        bool is_bytewise_comparator, const Slice& a,
+                        const Slice& b);
+#endif
+
 // BlockReadAmpBitmap is a bitmap that map the ROCKSDB_NAMESPACE::Block data
 // bytes to a bitmap with ratio bytes_per_bit. Whenever we access a range of
 // bytes in the Block we update the bitmap and increment
@@ -497,6 +503,12 @@ class BlockIter : public InternalIteratorBase<TValue> {
   uint8_t protection_bytes_per_key_;
 
   bool key_pinned_;
+#if defined(__riscv)
+  // Index blocks can contain user keys and bypass UserComparatorWrapper's
+  // perf-counted path. Cache the default comparator identity once so their
+  // binary searches can still avoid an indirect call.
+  bool is_bytewise_comparator_;
+#endif
   // Whether the block data is guaranteed to outlive this iterator, and
   // as long as the cleanup functions are transferred to another class,
   // e.g. PinnableSlice, the pointer to the bytes will still be valid.
@@ -574,6 +586,9 @@ class BlockIter : public InternalIteratorBase<TValue> {
     global_seqno_ = global_seqno;
     ts_sz_ = raw_ucmp->timestamp_size();
     pad_min_timestamp_ = ts_sz_ > 0 && !user_defined_timestamp_persisted;
+#if defined(__riscv)
+    is_bytewise_comparator_ = raw_ucmp == BytewiseComparator();
+#endif
     block_contents_pinned_ = block_contents_pinned;
     cache_handle_ = nullptr;
     cur_entry_idx_ = -1;
@@ -667,7 +682,12 @@ class BlockIter : public InternalIteratorBase<TValue> {
     assert(icmp_.user_comparator() != nullptr);
     if (raw_key_.IsUserKey()) {
       assert(global_seqno_ == kDisableGlobalSequenceNumber);
+#if defined(__riscv)
+      return CompareBlockUserKey(icmp_.user_comparator(),
+                                 is_bytewise_comparator_, a, b);
+#else
       return icmp_.user_comparator()->Compare(a, b);
+#endif
     } else if (global_seqno_ == kDisableGlobalSequenceNumber) {
       return icmp_.Compare(a, b);
     }

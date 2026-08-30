@@ -29,6 +29,17 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+#if defined(__riscv)
+__attribute__((noinline)) int CompareBlockUserKey(
+    const Comparator* comparator, bool is_bytewise_comparator, const Slice& a,
+    const Slice& b) {
+  if (is_bytewise_comparator) {
+    return a.compare(b);
+  }
+  return comparator->Compare(a, b);
+}
+#endif
+
 void DataBlockIter::NextImpl() {
 #ifndef NDEBUG
   if (TEST_Corrupt_Callback("DataBlockIter::NextImpl")) {
