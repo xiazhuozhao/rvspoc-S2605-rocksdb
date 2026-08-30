@@ -79,9 +79,46 @@ inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
     const uint64_t different = av ^ bv;
     if (different != 0) {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if defined(__riscv_zbb)
       return off + static_cast<size_t>(__builtin_ctzll(different) >> 3);
 #else
+      // RV64GCV does not imply Zbb, so __builtin_ctzll can become an
+      // out-of-line libgcc call. A byte-granularity binary search needs only
+      // shifts and branches and is faster on the portable RV64GCV baseline.
+      size_t byte = 0;
+      uint64_t remaining = different;
+      if ((remaining & UINT64_C(0xffffffff)) == 0) {
+        byte += 4;
+        remaining >>= 32;
+      }
+      if ((remaining & UINT64_C(0xffff)) == 0) {
+        byte += 2;
+        remaining >>= 16;
+      }
+      if ((remaining & UINT64_C(0xff)) == 0) {
+        ++byte;
+      }
+      return off + byte;
+#endif
+#else
+#if defined(__riscv_zbb)
       return off + static_cast<size_t>(__builtin_clzll(different) >> 3);
+#else
+      size_t byte = 0;
+      uint64_t remaining = different;
+      if ((remaining >> 32) == 0) {
+        byte += 4;
+        remaining <<= 32;
+      }
+      if ((remaining >> 48) == 0) {
+        byte += 2;
+        remaining <<= 16;
+      }
+      if ((remaining >> 56) == 0) {
+        ++byte;
+      }
+      return off + byte;
+#endif
 #endif
     }
     off += sizeof(uint64_t);

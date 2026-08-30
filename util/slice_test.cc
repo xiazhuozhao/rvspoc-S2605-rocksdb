@@ -33,6 +33,32 @@ TEST(SliceTest, StringView) {
   ASSERT_EQ(Slice(s), Slice(std::move(sv)));
 }
 
+TEST(SliceTest, DifferenceOffsetAndCompare) {
+  for (size_t length = 0; length <= 96; ++length) {
+    const std::string reference(length, 'a');
+    std::string other = reference;
+
+    ASSERT_EQ(length, Slice(reference).difference_offset(Slice(other)));
+    ASSERT_EQ(0, Slice(reference).compare(Slice(other)));
+    ASSERT_EQ(Slice(reference), Slice(other));
+
+    for (size_t difference = 0; difference < length; ++difference) {
+      other = reference;
+      other[difference] = 'b';
+      ASSERT_EQ(difference,
+                Slice(reference).difference_offset(Slice(other)));
+      ASSERT_LT(Slice(reference).compare(Slice(other)), 0);
+      ASSERT_NE(Slice(reference), Slice(other));
+
+      other[difference] = '`';
+      ASSERT_EQ(difference,
+                Slice(reference).difference_offset(Slice(other)));
+      ASSERT_GT(Slice(reference).compare(Slice(other)), 0);
+      ASSERT_NE(Slice(reference), Slice(other));
+    }
+  }
+}
+
 // Use this to keep track of the cleanups that were actually performed
 void Multiplier(void* arg1, void* arg2) {
   int* res = static_cast<int*>(arg1);
