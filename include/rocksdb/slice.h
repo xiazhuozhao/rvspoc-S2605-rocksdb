@@ -37,6 +37,49 @@ namespace ROCKSDB_NAMESPACE {
 #if defined(__riscv)
 namespace slice_riscv_detail {
 
+inline size_t DifferenceByte(uint64_t different) {
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#if defined(__riscv_zbb)
+  return static_cast<size_t>(__builtin_ctzll(different) >> 3);
+#else
+  // RV64GCV does not imply Zbb, so __builtin_ctzll can become an
+  // out-of-line libgcc call. A byte-granularity binary search needs only
+  // shifts and branches and is faster on the portable RV64GCV baseline.
+  size_t byte = 0;
+  if ((different & UINT64_C(0xffffffff)) == 0) {
+    byte += 4;
+    different >>= 32;
+  }
+  if ((different & UINT64_C(0xffff)) == 0) {
+    byte += 2;
+    different >>= 16;
+  }
+  if ((different & UINT64_C(0xff)) == 0) {
+    ++byte;
+  }
+  return byte;
+#endif
+#else
+#if defined(__riscv_zbb)
+  return static_cast<size_t>(__builtin_clzll(different) >> 3);
+#else
+  size_t byte = 0;
+  if ((different >> 32) == 0) {
+    byte += 4;
+    different <<= 32;
+  }
+  if ((different >> 48) == 0) {
+    byte += 2;
+    different <<= 16;
+  }
+  if ((different >> 56) == 0) {
+    ++byte;
+  }
+  return byte;
+#endif
+#endif
+}
+
 // Find the first different byte without calling the generic libc memcmp.
 // RVV naturally adapts to VLEN through vsetvl; a word-at-a-time fallback
 // keeps short keys cheap and also supports scalar RISC-V builds.
@@ -47,8 +90,17 @@ inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
     return 0;
   }
 #if defined(__riscv_vector)
-  if (len >= 32) {
-    size_t off = 0;
+  if (len >= 24) {
+    uint64_t a_prefix;
+    uint64_t b_prefix;
+    memcpy(&a_prefix, a, sizeof(a_prefix));
+    memcpy(&b_prefix, b, sizeof(b_prefix));
+    const uint64_t prefix_difference = a_prefix ^ b_prefix;
+    if (prefix_difference != 0) {
+      return DifferenceByte(prefix_difference);
+    }
+
+    size_t off = sizeof(uint64_t);
     while (off < len) {
       const size_t vl = __riscv_vsetvl_e8m1(len - off);
       const vuint8m1_t av = __riscv_vle8_v_u8m1(
@@ -78,48 +130,7 @@ inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
     memcpy(&bv, b + off, sizeof(bv));
     const uint64_t different = av ^ bv;
     if (different != 0) {
-#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
-#if defined(__riscv_zbb)
-      return off + static_cast<size_t>(__builtin_ctzll(different) >> 3);
-#else
-      // RV64GCV does not imply Zbb, so __builtin_ctzll can become an
-      // out-of-line libgcc call. A byte-granularity binary search needs only
-      // shifts and branches and is faster on the portable RV64GCV baseline.
-      size_t byte = 0;
-      uint64_t remaining = different;
-      if ((remaining & UINT64_C(0xffffffff)) == 0) {
-        byte += 4;
-        remaining >>= 32;
-      }
-      if ((remaining & UINT64_C(0xffff)) == 0) {
-        byte += 2;
-        remaining >>= 16;
-      }
-      if ((remaining & UINT64_C(0xff)) == 0) {
-        ++byte;
-      }
-      return off + byte;
-#endif
-#else
-#if defined(__riscv_zbb)
-      return off + static_cast<size_t>(__builtin_clzll(different) >> 3);
-#else
-      size_t byte = 0;
-      uint64_t remaining = different;
-      if ((remaining >> 32) == 0) {
-        byte += 4;
-        remaining <<= 32;
-      }
-      if ((remaining >> 48) == 0) {
-        byte += 2;
-        remaining <<= 16;
-      }
-      if ((remaining >> 56) == 0) {
-        ++byte;
-      }
-      return off + byte;
-#endif
-#endif
+      return off + DifferenceByte(different);
     }
     off += sizeof(uint64_t);
   }
