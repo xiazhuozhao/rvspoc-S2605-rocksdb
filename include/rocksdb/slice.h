@@ -116,7 +116,9 @@ inline size_t DifferenceOffset(const char* a, const char* b, size_t len) {
     }
     return off;
   }
-  size_t off = 0;
+  // The first byte was already checked above. Starting at byte one avoids
+  // reloading it and gives short, equal keys a tighter scalar schedule.
+  size_t off = 1;
 #else
   // On scalar RISC-V the existing offset-one loop gives the compiler a
   // better short-key schedule. Keep it as the fallback rather than forcing
