@@ -17,6 +17,7 @@
 - 模拟器：QEMU 8.2.9 user mode，VLEN=128/256/512
 - RocksDB：11.1.1
 - RocketMQ：5.5.0
+- 长稳验证服务器：SG2044，64 核 RV64GCV，openEuler 24.03 LTS-SP3，Linux 6.12.74，OpenJDK 21.0.9
 
 赛事验证平台为蓝芯 LX5000；MUSE Pi Pro 与 SG2044 服务器仅为提交前真机验证环境，代码不限定这些机器。构建依赖 CMake、GNU GCC 16.1、目标 sysroot、RISC-V 版 gflags 与 zstd。RocketMQ 集成另需 JDK 17 以上、Maven 3 和官方 5.5.0 源码。所有步骤以普通用户运行，不需要 root 权限；构建和测试目录应放在空间充足的数据盘。
 
@@ -122,7 +123,16 @@ CRC32C 使用相同输入缓冲区、迭代次数与 CPU 亲和性测得：
 
 ## RocketMQ 5.5.0 集成验证
 
-构建 JNI 共享库和架构匹配的 JAR 后，将 JAR 安装到隔离的 Maven 仓库，再构建官方 RocketMQ 5.5.0：
+在 RVV 构建目录的现有交叉编译 cache 上启用 JNI。`JAVA_HOME` 必须指向构建主机上可运行的 JDK；JNI 头文件不进入目标机运行时依赖：
+
+```sh
+JAVA_HOME=/path/to/host-jdk cmake -S . -B /data/xzz/build-rocksdb-rvv \
+  -DWITH_JNI=ON
+JAVA_HOME=/path/to/host-jdk cmake --build /data/xzz/build-rocksdb-rvv \
+  --target rocksdbjava -j
+```
+
+产物位于构建目录的 `java/librocksdbjni-linux-riscv64.so` 和 `java/rocksdbjni-11.1.1-linux-riscv64.jar`。将 JAR 安装到隔离的 Maven 仓库，再构建官方 RocketMQ 5.5.0：
 
 ```sh
 mvn -Dmaven.repo.local=/data/xzz/m2 \
@@ -131,6 +141,7 @@ mvn -Dmaven.repo.local=/data/xzz/m2 \
   -DgroupId=org.apache.rocketmq -DartifactId=rocketmq-rocksdb \
   -Dversion=1.0.6 -Dpackaging=jar
 
+cd /path/to/rocketmq-all-5.5.0
 mvn -Dmaven.repo.local=/data/xzz/m2 -DskipTests package
 ```
 
@@ -142,7 +153,75 @@ mvn -Dmaven.repo.local=/data/xzz/m2 -DskipTests package
 | 4 KiB，同步写，8 线程，20,000 条 | 715 TPS | 2,142 / 11.130 ms | 0 |
 | 128 B 积压消费，16 线程 | 峰值 4,700 TPS | 积压消息端到端延迟 | 0 |
 
-长稳测试可使用官方 producer/consumer benchmark 连续运行 60 分钟，覆盖 128 B、4 KiB、大 value 与积压消费。应同时保存 Broker 日志、错误计数、TPS、P99（由外部采样器计算）、磁盘用量和正常关闭结果；测试目录应置于空间充足的数据盘，并设置容量保护。
+60 分钟长稳测试使用 `storeType=defaultRocksDB` 的单 Broker，并把 `storePathRootDir` 和 `storePathCommitLog` 指向空间充足的数据盘。配置文件至少包含以下项目，其余项沿用 RocketMQ 默认值：
+
+```properties
+brokerClusterName=Task5StabilityCluster
+brokerName=broker-task5-rvv
+brokerId=0
+namesrvAddr=127.0.0.1:9876
+brokerIP1=127.0.0.1
+storeType=defaultRocksDB
+storePathRootDir=/data/xzz/rocketmq-task5/store
+storePathCommitLog=/data/xzz/rocketmq-task5/store/commitlog
+autoCreateTopicEnable=true
+```
+
+以下命令同时覆盖 128 B 混合收发、4 KiB 大消息和延迟 10 分钟启动消费者形成的积压；目录和 JVM 大小应按验证机调整：
+
+```sh
+export JAVA_HOME=/path/to/jdk-17-or-newer
+export ROCKETMQ_HOME=/path/to/rocketmq-5.5.0
+export NAMESRV=127.0.0.1:9876
+export CLASSPATH="$ROCKETMQ_HOME/conf:$ROCKETMQ_HOME/lib/*"
+java_client=("$JAVA_HOME/bin/java" -Xms1g -Xmx1g -cp "$CLASSPATH")
+
+JAVA_HOME="$JAVA_HOME" nohup "$ROCKETMQ_HOME/bin/mqnamesrv" \
+  > namesrv.log 2>&1 &
+namesrv_pid=$!
+JAVA_HOME="$JAVA_HOME" nohup "$ROCKETMQ_HOME/bin/mqbroker" \
+  -n "$NAMESRV" -c /path/to/broker-rocksdb.conf > broker.log 2>&1 &
+broker_pid=$!
+
+timeout 4200 "${java_client[@]}" \
+  org.apache.rocketmq.example.benchmark.Consumer \
+  -n "$NAMESRV" -t Task5StabilitySmall -g task5_small -w 16 -ri 10000 \
+  > consumer-small.log 2>&1 &
+small_consumer=$!
+( sleep 600; timeout 3600 "${java_client[@]}" \
+  org.apache.rocketmq.example.benchmark.Consumer \
+  -n "$NAMESRV" -t Task5StabilityLarge -g task5_large -w 16 -ri 10000 \
+  > consumer-large.log 2>&1 ) &
+large_consumer=$!
+
+timeout 3600 "${java_client[@]}" \
+  -Dorg.apache.rocketmq.client.sendSmartMsg=true \
+  org.apache.rocketmq.example.benchmark.Producer \
+  -n "$NAMESRV" -t Task5StabilitySmall -s 128 -w 16 -q 0 -ri 10000 \
+  > producer-small.log 2>&1 &
+small_producer=$!
+timeout 3600 "${java_client[@]}" \
+  -Dorg.apache.rocketmq.client.sendSmartMsg=true \
+  org.apache.rocketmq.example.benchmark.Producer \
+  -n "$NAMESRV" -t Task5StabilityLarge -s 4096 -w 8 -q 0 -ri 10000 \
+  > producer-large.log 2>&1 &
+large_producer=$!
+wait "$small_producer" || test $? -eq 124
+wait "$large_producer" || test $? -eq 124
+```
+
+运行期间每 30 秒记录 Broker/NameServer 存活状态、内存和磁盘余量，并在磁盘可用空间低于预计安全线时主动终止。生产结束后允许消费者排空积压，再用 `mqadmin consumerProgress` 确认两个消费组的 `Diff Total` 均为 0；随后按启动时记录的 PID 终止两个消费者及本轮 Broker/NameServer 进程树并等待正常退出。同时检查 producer/consumer 失败计数、Broker 的 OOM/Corruption/Background error 和最终磁盘用量。RocketMQ 自带的 `mqshutdown` 按进程名匹配，在同一账号运行多个实例的共享服务器上不可使用，以免停止其他实例。P99 需由外部采样器从同一轮请求延迟采样计算，不能用最大 RT 代替。
+
+2026-09-01 在 SG2044 上完成了一轮正式长稳验证。生产持续 60 分钟，完整流程从 14:23:13 至 15:24:36；4 KiB 消费者延迟 10 分钟启动，形成约 10 分钟积压后追平。使用的 `rocketmq-rocksdb-1.0.6.jar` SHA-256 为 `dac722d0fd05054669c66cde4c3b1620eab3e722893bf97b881e26bbfd7e35e1`。
+
+| 场景 | 10 秒样本数 | TPS 中位数 | 样本平均 RT 中位数 | 失败 |
+|---|---:|---:|---:|---:|
+| 128 B 同步生产，16 线程 | 359 | 4,126 | 3.875 ms | 0 |
+| 4 KiB 同步生产，8 线程 | 359 | 2,449 | 3.261 ms | 0 |
+| 128 B 消费，16 线程 | 357 | 4,125 | 6.643 ms B2C | 0 |
+| 4 KiB 积压消费，16 线程 | 300 | 2,464 | 6.314 ms B2C | 0 |
+
+最终 Broker 状态中 `putMessageTimesTotal` 与 `msgGetTotalTodayNow` 均为 23,455,128，`dispatchBehindBytes=0`；两个消费组均为 `Diff Total=0`、`Inflight Total=0`。120 次健康采样中的最低磁盘可用空间为 724,601,757,696 字节，最终 store 目录约 42 GB。Broker 和客户端日志中没有 OOM、Corruption、Background error、发送失败、响应失败或消费失败，测试进程正常退出。4 KiB 消费端观测到的最大 B2C 延迟为 602,030 ms，对应人为设置的 10 分钟积压窗口，不是稳态请求 P99。
 
 ## 可移植性
 
