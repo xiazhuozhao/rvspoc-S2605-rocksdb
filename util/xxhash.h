@@ -3063,7 +3063,9 @@ XXH_PUBLIC_API XXH64_hash_t XXH64_hashFromCanonical(XXH_NOESCAPE const XXH64_can
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
-#  if defined(__ARM_FEATURE_SVE)
+#  if defined(__riscv_vector)
+#    include <riscv_vector.h>
+#  elif defined(__ARM_FEATURE_SVE)
 #    include <arm_sve.h>
 #  elif defined(__ARM_NEON__) || defined(__ARM_NEON) \
    || defined(__aarch64__)  || defined(_M_ARM) \
@@ -3193,6 +3195,7 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
     XXH_NEON   = 4,  /*!< NEON for most ARMv7-A and all AArch64 */
     XXH_VSX    = 5,  /*!< VSX and ZVector for POWER8/z13 (64-bit) */
     XXH_SVE    = 6,  /*!< SVE for some ARMv8-A and ARMv9-A */
+    XXH_RVV    = 7,  /*!< RISC-V Vector Extension 1.0 */
 };
 /*!
  * @ingroup tuning
@@ -3215,10 +3218,14 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
 #  define XXH_NEON   4
 #  define XXH_VSX    5
 #  define XXH_SVE    6
+#  define XXH_RVV    7
 #endif
 
 #ifndef XXH_VECTOR    /* can be defined on command line */
-#  if defined(__ARM_FEATURE_SVE)
+#  if defined(__riscv_vector) \
+   && (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#    define XXH_VECTOR XXH_RVV
+#  elif defined(__ARM_FEATURE_SVE)
 #    define XXH_VECTOR XXH_SVE
 #  elif ( \
         defined(__ARM_NEON__) || defined(__ARM_NEON) /* gcc */ \
@@ -3275,6 +3282,8 @@ enum XXH_VECTOR_TYPE /* fake enum */ {
 #     define XXH_ACC_ALIGN 64
 #  elif XXH_VECTOR == XXH_SVE   /* sve */
 #     define XXH_ACC_ALIGN 64
+#  elif XXH_VECTOR == XXH_RVV   /* rvv */
+#     define XXH_ACC_ALIGN 8
 #  endif
 #endif
 
@@ -4907,6 +4916,100 @@ XXH3_accumulate_sve(xxh_u64* XXH_RESTRICT acc,
 
 #endif
 
+#if (XXH_VECTOR == XXH_RVV)
+
+/*
+ * RVV is vector-length agnostic.  The strided pair loads preserve XXH3's
+ * adjacent-lane swap without assuming a particular VLEN.
+ */
+XXH_FORCE_INLINE void
+XXH3_accumulate_512_rvv(void* XXH_RESTRICT acc,
+                        const void* XXH_RESTRICT input,
+                        const void* XXH_RESTRICT secret)
+{
+    xxh_u64* const xacc = (xxh_u64*)acc;
+    const xxh_u64* const xinput = (const xxh_u64*)input;
+    const xxh_u64* const xsecret = (const xxh_u64*)secret;
+    ptrdiff_t const stride = (ptrdiff_t)(2 * sizeof(xxh_u64));
+    size_t const vl = __riscv_vsetvl_e64m2(XXH_ACC_NB / 2);
+    vuint64m2_t const data0 = __riscv_vlse64_v_u64m2(xinput, stride, vl);
+    vuint64m2_t const data1 = __riscv_vlse64_v_u64m2(xinput + 1, stride, vl);
+    vuint64m2_t keyed0 = __riscv_vlse64_v_u64m2(xsecret, stride, vl);
+    vuint64m2_t keyed1 = __riscv_vlse64_v_u64m2(xsecret + 1, stride, vl);
+    vuint64m2_t acc0 = __riscv_vlse64_v_u64m2(xacc, stride, vl);
+    vuint64m2_t acc1 = __riscv_vlse64_v_u64m2(xacc + 1, stride, vl);
+    keyed0 = __riscv_vxor_vv_u64m2(data0, keyed0, vl);
+    keyed1 = __riscv_vxor_vv_u64m2(data1, keyed1, vl);
+    acc0 = __riscv_vadd_vv_u64m2(acc0, data1, vl);
+    acc1 = __riscv_vadd_vv_u64m2(acc1, data0, vl);
+    acc0 = __riscv_vadd_vv_u64m2(acc0,
+        __riscv_vmul_vv_u64m2(
+            __riscv_vand_vx_u64m2(keyed0, 0xFFFFFFFFU, vl),
+            __riscv_vsrl_vx_u64m2(keyed0, 32, vl), vl), vl);
+    acc1 = __riscv_vadd_vv_u64m2(acc1,
+        __riscv_vmul_vv_u64m2(
+            __riscv_vand_vx_u64m2(keyed1, 0xFFFFFFFFU, vl),
+            __riscv_vsrl_vx_u64m2(keyed1, 32, vl), vl), vl);
+    __riscv_vsse64_v_u64m2(xacc, stride, acc0, vl);
+    __riscv_vsse64_v_u64m2(xacc + 1, stride, acc1, vl);
+}
+
+XXH_FORCE_INLINE void
+XXH3_accumulate_rvv(xxh_u64* XXH_RESTRICT acc,
+                    const xxh_u8* XXH_RESTRICT input,
+                    const xxh_u8* XXH_RESTRICT secret,
+                    size_t nbStripes)
+{
+    ptrdiff_t const stride = (ptrdiff_t)(2 * sizeof(xxh_u64));
+    size_t const vl = __riscv_vsetvl_e64m2(XXH_ACC_NB / 2);
+    vuint64m2_t acc0 = __riscv_vlse64_v_u64m2(acc, stride, vl);
+    vuint64m2_t acc1 = __riscv_vlse64_v_u64m2(acc + 1, stride, vl);
+#if defined(__GNUC__) && !defined(__clang__)
+#  pragma GCC unroll 1
+#endif
+    while (nbStripes-- != 0) {
+        const xxh_u64* const xinput = (const xxh_u64*)(const void*)input;
+        const xxh_u64* const xsecret = (const xxh_u64*)(const void*)secret;
+        vuint64m2_t const data0 = __riscv_vlse64_v_u64m2(xinput, stride, vl);
+        vuint64m2_t const data1 = __riscv_vlse64_v_u64m2(xinput + 1, stride, vl);
+        vuint64m2_t keyed0 = __riscv_vlse64_v_u64m2(xsecret, stride, vl);
+        vuint64m2_t keyed1 = __riscv_vlse64_v_u64m2(xsecret + 1, stride, vl);
+        keyed0 = __riscv_vxor_vv_u64m2(data0, keyed0, vl);
+        keyed1 = __riscv_vxor_vv_u64m2(data1, keyed1, vl);
+        acc0 = __riscv_vadd_vv_u64m2(acc0, data1, vl);
+        acc1 = __riscv_vadd_vv_u64m2(acc1, data0, vl);
+        acc0 = __riscv_vadd_vv_u64m2(acc0,
+            __riscv_vmul_vv_u64m2(
+                __riscv_vand_vx_u64m2(keyed0, 0xFFFFFFFFU, vl),
+                __riscv_vsrl_vx_u64m2(keyed0, 32, vl), vl), vl);
+        acc1 = __riscv_vadd_vv_u64m2(acc1,
+            __riscv_vmul_vv_u64m2(
+                __riscv_vand_vx_u64m2(keyed1, 0xFFFFFFFFU, vl),
+                __riscv_vsrl_vx_u64m2(keyed1, 32, vl), vl), vl);
+        input += XXH_STRIPE_LEN;
+        secret += XXH_SECRET_CONSUME_RATE;
+    }
+    __riscv_vsse64_v_u64m2(acc, stride, acc0, vl);
+    __riscv_vsse64_v_u64m2(acc + 1, stride, acc1, vl);
+}
+
+XXH_FORCE_INLINE void
+XXH3_scrambleAcc_rvv(void* XXH_RESTRICT acc, const void* XXH_RESTRICT secret)
+{
+    xxh_u64* xacc = (xxh_u64*)acc;
+    const xxh_u64* xsecret = (const xxh_u64*)secret;
+    size_t const vl = __riscv_vsetvl_e64m4(XXH_ACC_NB);
+    vuint64m4_t accv = __riscv_vle64_v_u64m4(xacc, vl);
+    vuint64m4_t const secretv = __riscv_vle64_v_u64m4(xsecret, vl);
+    accv = __riscv_vxor_vv_u64m4(accv,
+        __riscv_vsrl_vx_u64m4(accv, 47, vl), vl);
+    accv = __riscv_vxor_vv_u64m4(accv, secretv, vl);
+    accv = __riscv_vmul_vx_u64m4(accv, XXH_PRIME32_1, vl);
+    __riscv_vse64_v_u64m4(xacc, accv, vl);
+}
+
+#endif
+
 /* scalar variants - universal */
 
 /*!
@@ -5112,6 +5215,13 @@ typedef void (*XXH3_f_initCustomSecret)(void* XXH_RESTRICT, xxh_u64);
 #define XXH3_scrambleAcc    XXH3_scrambleAcc_scalar
 #define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
 
+#elif (XXH_VECTOR == XXH_RVV)
+/* A standalone 64-byte strided round does not amortize vector setup. */
+#define XXH3_accumulate_512 XXH3_accumulate_512_scalar
+#define XXH3_accumulate     XXH3_accumulate_rvv
+#define XXH3_scrambleAcc    XXH3_scrambleAcc_rvv
+#define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
+
 #else /* scalar */
 
 #define XXH3_accumulate_512 XXH3_accumulate_512_scalar
@@ -5119,6 +5229,13 @@ typedef void (*XXH3_f_initCustomSecret)(void* XXH_RESTRICT, xxh_u64);
 #define XXH3_scrambleAcc    XXH3_scrambleAcc_scalar
 #define XXH3_initCustomSecret XXH3_initCustomSecret_scalar
 
+#endif
+
+#if (XXH_VECTOR == XXH_RVV)
+/* Real RVV measurements show that the scalar backend wins for short and
+ * medium one-shot inputs, while RVV pulls ahead once enough blocks amortize
+ * setup.  This portable length dispatch uses no vendor-specific extension. */
+#  define XXH3_RVV_MIN_LENGTH 16384
 #endif
 
 #if XXH_SIZE_OPT >= 1 /* don't do SIMD for initialization */
@@ -5215,6 +5332,16 @@ XXH3_hashLong_64b_internal(const void* XXH_RESTRICT input, size_t len,
     return XXH3_mergeAccs(acc, (const xxh_u8*)secret + XXH_SECRET_MERGEACCS_START, (xxh_u64)len * XXH_PRIME64_1);
 }
 
+#if (XXH_VECTOR == XXH_RVV)
+XXH_NO_INLINE XXH64_hash_t
+XXH3_hashLong_64b_scalarFallback(const void* XXH_RESTRICT input, size_t len,
+                                 const void* XXH_RESTRICT secret, size_t secretLen)
+{
+    return XXH3_hashLong_64b_internal(input, len, secret, secretLen,
+                                      XXH3_accumulate_scalar, XXH3_scrambleAcc_scalar);
+}
+#endif
+
 /*
  * It's important for performance to transmit secret's size (when it's static)
  * so that the compiler can properly optimize the vectorized loop.
@@ -5225,7 +5352,12 @@ XXH3_hashLong_64b_withSecret(const void* XXH_RESTRICT input, size_t len,
                              XXH64_hash_t seed64, const xxh_u8* XXH_RESTRICT secret, size_t secretLen)
 {
     (void)seed64;
-    return XXH3_hashLong_64b_internal(input, len, secret, secretLen, XXH3_accumulate, XXH3_scrambleAcc);
+#if (XXH_VECTOR == XXH_RVV)
+    if (len < XXH3_RVV_MIN_LENGTH)
+        return XXH3_hashLong_64b_scalarFallback(input, len, secret, secretLen);
+#endif
+    return XXH3_hashLong_64b_internal(input, len, secret, secretLen,
+                                      XXH3_accumulate, XXH3_scrambleAcc);
 }
 
 /*
@@ -5239,7 +5371,13 @@ XXH3_hashLong_64b_default(const void* XXH_RESTRICT input, size_t len,
                           XXH64_hash_t seed64, const xxh_u8* XXH_RESTRICT secret, size_t secretLen)
 {
     (void)seed64; (void)secret; (void)secretLen;
-    return XXH3_hashLong_64b_internal(input, len, XXH3_kSecret, sizeof(XXH3_kSecret), XXH3_accumulate, XXH3_scrambleAcc);
+#if (XXH_VECTOR == XXH_RVV)
+    if (len < XXH3_RVV_MIN_LENGTH)
+        return XXH3_hashLong_64b_scalarFallback(input, len, XXH3_kSecret,
+                                                sizeof(XXH3_kSecret));
+#endif
+    return XXH3_hashLong_64b_internal(input, len, XXH3_kSecret, sizeof(XXH3_kSecret),
+                                      XXH3_accumulate, XXH3_scrambleAcc);
 }
 
 /*
@@ -5273,6 +5411,17 @@ XXH3_hashLong_64b_withSeed_internal(const void* input, size_t len,
     }
 }
 
+#if (XXH_VECTOR == XXH_RVV)
+XXH_NO_INLINE XXH64_hash_t
+XXH3_hashLong_64b_withSeed_scalarFallback(const void* input, size_t len,
+                                           XXH64_hash_t seed)
+{
+    return XXH3_hashLong_64b_withSeed_internal(input, len, seed,
+                XXH3_accumulate_scalar, XXH3_scrambleAcc_scalar,
+                XXH3_initCustomSecret_scalar);
+}
+#endif
+
 /*
  * It's important for performance that XXH3_hashLong is not inlined.
  */
@@ -5281,6 +5430,10 @@ XXH3_hashLong_64b_withSeed(const void* XXH_RESTRICT input, size_t len,
                            XXH64_hash_t seed, const xxh_u8* XXH_RESTRICT secret, size_t secretLen)
 {
     (void)secret; (void)secretLen;
+#if (XXH_VECTOR == XXH_RVV)
+    if (len < XXH3_RVV_MIN_LENGTH)
+        return XXH3_hashLong_64b_withSeed_scalarFallback(input, len, seed);
+#endif
     return XXH3_hashLong_64b_withSeed_internal(input, len, seed,
                 XXH3_accumulate, XXH3_scrambleAcc, XXH3_initCustomSecret);
 }
@@ -6023,6 +6176,16 @@ XXH3_hashLong_128b_internal(const void* XXH_RESTRICT input, size_t len,
     }
 }
 
+#if (XXH_VECTOR == XXH_RVV)
+XXH_NO_INLINE XXH128_hash_t
+XXH3_hashLong_128b_scalarFallback(const void* XXH_RESTRICT input, size_t len,
+                                  const xxh_u8* XXH_RESTRICT secret, size_t secretLen)
+{
+    return XXH3_hashLong_128b_internal(input, len, secret, secretLen,
+                                       XXH3_accumulate_scalar, XXH3_scrambleAcc_scalar);
+}
+#endif
+
 /*
  * It's important for performance that XXH3_hashLong() is not inlined.
  */
@@ -6032,6 +6195,11 @@ XXH3_hashLong_128b_default(const void* XXH_RESTRICT input, size_t len,
                            const void* XXH_RESTRICT secret, size_t secretLen)
 {
     (void)seed64; (void)secret; (void)secretLen;
+#if (XXH_VECTOR == XXH_RVV)
+    if (len < XXH3_RVV_MIN_LENGTH)
+        return XXH3_hashLong_128b_scalarFallback(input, len, XXH3_kSecret,
+                                                 sizeof(XXH3_kSecret));
+#endif
     return XXH3_hashLong_128b_internal(input, len, XXH3_kSecret, sizeof(XXH3_kSecret),
                                        XXH3_accumulate, XXH3_scrambleAcc);
 }
@@ -6046,6 +6214,11 @@ XXH3_hashLong_128b_withSecret(const void* XXH_RESTRICT input, size_t len,
                               const void* XXH_RESTRICT secret, size_t secretLen)
 {
     (void)seed64;
+#if (XXH_VECTOR == XXH_RVV)
+    if (len < XXH3_RVV_MIN_LENGTH)
+        return XXH3_hashLong_128b_scalarFallback(input, len,
+                                                 (const xxh_u8*)secret, secretLen);
+#endif
     return XXH3_hashLong_128b_internal(input, len, (const xxh_u8*)secret, secretLen,
                                        XXH3_accumulate, XXH3_scrambleAcc);
 }
@@ -6068,6 +6241,17 @@ XXH3_hashLong_128b_withSeed_internal(const void* XXH_RESTRICT input, size_t len,
     }
 }
 
+#if (XXH_VECTOR == XXH_RVV)
+XXH_NO_INLINE XXH128_hash_t
+XXH3_hashLong_128b_withSeed_scalarFallback(const void* input, size_t len,
+                                            XXH64_hash_t seed64)
+{
+    return XXH3_hashLong_128b_withSeed_internal(input, len, seed64,
+                XXH3_accumulate_scalar, XXH3_scrambleAcc_scalar,
+                XXH3_initCustomSecret_scalar);
+}
+#endif
+
 /*
  * It's important for performance that XXH3_hashLong is not inlined.
  */
@@ -6076,6 +6260,10 @@ XXH3_hashLong_128b_withSeed(const void* input, size_t len,
                             XXH64_hash_t seed64, const void* XXH_RESTRICT secret, size_t secretLen)
 {
     (void)secret; (void)secretLen;
+#if (XXH_VECTOR == XXH_RVV)
+    if (len < XXH3_RVV_MIN_LENGTH)
+        return XXH3_hashLong_128b_withSeed_scalarFallback(input, len, seed64);
+#endif
     return XXH3_hashLong_128b_withSeed_internal(input, len, seed64,
                 XXH3_accumulate, XXH3_scrambleAcc, XXH3_initCustomSecret);
 }

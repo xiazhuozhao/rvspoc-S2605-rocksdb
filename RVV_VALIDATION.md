@@ -21,17 +21,18 @@
 
 因此，题面点名设施的功能覆盖为 **3/3（100%）**。这不等同于“已有 ARM/Neon 优化算子至少 90%”的架构对等覆盖。
 
-以 `v11.1.1` 基线中 RocksDB 自有源码（排除第三方目录）实际存在的 ARM 专用加速设施为分母，可识别三族：Arm64 CRC32C（CRC/PMULL）、当前版 XXH3 NEON/SVE 哈希（`util/xxhash.h`）和格式兼容的 preview XXPH3 NEON 哈希（`util/xxph3.h`）。后两者产生和服务于不同的哈希接口，不能合并为一个实现。当前分支为 CRC32C 提供 RVV/通用 RISC-V 加速，但两个哈希头均无 RVV 后端，因此严格架构对等覆盖为 **1/3（33.33%）**，未达到 90%。Bloom RVV 和 SST/Slice RVV 路径是题面点名的新优化，不能拿来替代缺失的两个哈希对等项。
+以 `v11.1.1` 基线中 RocksDB 自有源码（排除第三方目录）实际存在的 ARM 专用加速设施为分母，可识别三族：Arm64 CRC32C（CRC/PMULL）、当前版 XXH3 NEON/SVE 哈希（`util/xxhash.h`）和格式兼容的 preview XXPH3 NEON 哈希（`util/xxph3.h`）。后两者产生和服务于不同的哈希接口，不能合并为一个实现。当前分支为三族都提供 RVV/通用 RISC-V 对等实现，因此严格架构对等覆盖为 **3/3（100%）**，超过 90% 要求。Bloom RVV 和 SST/Slice RVV 路径仍作为题面点名的新优化单独统计，不用于替代这三项分母。
 
 ```sh
 git grep -n -E '__ARM_NEON|__aarch64__|HAVE_ARM64_CRC|XXPH_NEON' v11.1.1 -- \
   'util/*' 'table/*' 'db/*' 'memtable/*' 'port/*'
 rg -n '__riscv_vector|__riscv_[A-Za-z0-9_]+' \
-  util/bloom_impl.h util/crc32c.cc include/rocksdb/slice.h \
+  util/bloom_impl.h util/crc32c.cc util/xxhash.h util/xxph3.h \
+  include/rocksdb/slice.h \
   table/block_based/block.cc
 ```
 
-这里的 1/3 是静态设施族覆盖率，不是动态向量指令比例。CRC 的短输入和 Bloom 的常见低 probe 数保留标量路径，属于按长度/工作量分发；只有实际进入 RVV 分支的调用才产生 RVV 指令。
+这里的 3/3 是静态设施族覆盖率，不是动态向量指令比例。CRC、Bloom 和当前版 XXH3 均保留按长度/工作量分发；XXH3 的短中输入继续使用标量路径，足够长的批量 stripe 才进入 VLEN 无关的 RVV 后端。preview XXPH3 的长输入直接使用 RVV 后端。只有实际进入 RVV 分支的调用才产生 RVV 指令。
 
 ## 验证环境
 

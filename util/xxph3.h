@@ -710,7 +710,9 @@ static const xxh_u64 PRIME64_5 = 0x27D4EB2F165667C5ULL;   /* 0b00100111110101001
 #endif
 
 #if defined(__GNUC__)
-#  if defined(__AVX2__)
+#  if defined(__riscv_vector)
+#    include <riscv_vector.h>
+#  elif defined(__AVX2__)
 #    include <immintrin.h>
 #  elif defined(__SSE2__)
 #    include <emmintrin.h>
@@ -766,9 +768,13 @@ static const xxh_u64 PRIME64_5 = 0x27D4EB2F165667C5ULL;   /* 0b00100111110101001
 #define XXPH_AVX2   2
 #define XXPH_NEON   3
 #define XXPH_VSX    4
+#define XXPH_RVV    5
 
 #ifndef XXPH_VECTOR    /* can be defined on command line */
-#  if defined(__AVX2__)
+#  if defined(__riscv_vector) \
+   && (!defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+#    define XXPH_VECTOR XXPH_RVV
+#  elif defined(__AVX2__)
 #    define XXPH_VECTOR XXPH_AVX2
 #  elif defined(__SSE2__) || defined(_M_AMD64) || defined(_M_X64) || (defined(_M_IX86_FP) && (_M_IX86_FP == 2))
 #    define XXPH_VECTOR XXPH_SSE2
@@ -797,6 +803,8 @@ static const xxh_u64 PRIME64_5 = 0x27D4EB2F165667C5ULL;   /* 0b00100111110101001
 #     define XXPH_ACC_ALIGN 16
 #  elif XXPH_VECTOR == 4  /* vsx */
 #     define XXPH_ACC_ALIGN 16
+#  elif XXPH_VECTOR == 5  /* rvv */
+#     define XXPH_ACC_ALIGN 8
 #  endif
 #endif
 
@@ -1154,7 +1162,31 @@ XXPH3_accumulate_512(      void* XXPH_RESTRICT acc,
                     const void* XXPH_RESTRICT secret,
                     XXPH3_accWidth_e accWidth)
 {
-#if (XXPH_VECTOR == XXPH_AVX2)
+#if (XXPH_VECTOR == XXPH_RVV)
+
+    XXPH_ALIGN(XXPH_ACC_ALIGN) xxh_u64* const xacc = (xxh_u64*)acc;
+    const xxh_u64* const xinput = (const xxh_u64*)input;
+    const xxh_u64* const xsecret = (const xxh_u64*)secret;
+    size_t const vl = __riscv_vsetvl_e64m4(ACC_NB);
+    vuint64m4_t const data = __riscv_vle64_v_u64m4(xinput, vl);
+    vuint64m4_t keyed = __riscv_vle64_v_u64m4(xsecret, vl);
+    vuint64m4_t xaccv = __riscv_vle64_v_u64m4(xacc, vl);
+    keyed = __riscv_vxor_vv_u64m4(data, keyed, vl);
+    if (accWidth == XXPH3_acc_128bits) {
+        vuint64m4_t const swap_index = __riscv_vxor_vx_u64m4(
+            __riscv_vid_v_u64m4(vl), 1, vl);
+        xaccv = __riscv_vadd_vv_u64m4(xaccv,
+            __riscv_vrgather_vv_u64m4(data, swap_index, vl), vl);
+    } else {
+        xaccv = __riscv_vadd_vv_u64m4(xaccv, data, vl);
+    }
+    xaccv = __riscv_vadd_vv_u64m4(xaccv,
+        __riscv_vmul_vv_u64m4(
+            __riscv_vand_vx_u64m4(keyed, 0xFFFFFFFFU, vl),
+            __riscv_vsrl_vx_u64m4(keyed, 32, vl), vl), vl);
+    __riscv_vse64_v_u64m4(xacc, xaccv, vl);
+
+#elif (XXPH_VECTOR == XXPH_AVX2)
 
     XXPH_ASSERT((((size_t)acc) & 31) == 0);
     {   XXPH_ALIGN(32) __m256i* const xacc  =       (__m256i *) acc;
@@ -1343,7 +1375,20 @@ XXPH3_accumulate_512(      void* XXPH_RESTRICT acc,
 XXPH_FORCE_INLINE void
 XXPH3_scrambleAcc(void* XXPH_RESTRICT acc, const void* XXPH_RESTRICT secret)
 {
-#if (XXPH_VECTOR == XXPH_AVX2)
+#if (XXPH_VECTOR == XXPH_RVV)
+
+    XXPH_ALIGN(XXPH_ACC_ALIGN) xxh_u64* xacc = (xxh_u64*)acc;
+    const xxh_u64* xsecret = (const xxh_u64*)secret;
+    size_t const vl = __riscv_vsetvl_e64m4(ACC_NB);
+    vuint64m4_t accv = __riscv_vle64_v_u64m4(xacc, vl);
+    vuint64m4_t const secretv = __riscv_vle64_v_u64m4(xsecret, vl);
+    accv = __riscv_vxor_vv_u64m4(accv,
+        __riscv_vsrl_vx_u64m4(accv, 47, vl), vl);
+    accv = __riscv_vxor_vv_u64m4(accv, secretv, vl);
+    accv = __riscv_vmul_vx_u64m4(accv, PRIME32_1, vl);
+    __riscv_vse64_v_u64m4(xacc, accv, vl);
+
+#elif (XXPH_VECTOR == XXPH_AVX2)
 
     XXPH_ASSERT((((size_t)acc) & 31) == 0);
     {   XXPH_ALIGN(32) __m256i* const xacc = (__m256i*) acc;
